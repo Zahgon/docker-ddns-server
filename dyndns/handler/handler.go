@@ -1,9 +1,10 @@
 package handler
 
 import (
+	"encoding/base64"
 	"fmt"
-
-	"github.com/labstack/gommon/log"
+	"log"
+	"net/http"
 
 	"os"
 	"strconv"
@@ -11,8 +12,8 @@ import (
 	"time"
 
 	"github.com/benjaminbear/docker-ddns-server/dyndns/model"
+	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
-	"github.com/labstack/echo/v4"
 	"github.com/tg123/go-htpasswd"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -44,39 +45,101 @@ func (cv *CustomValidator) Validate(i interface{}) error {
 	return cv.Validator.Struct(i)
 }
 
+// defaultValidator replaces echo's e.Validator, which gin has no equivalent for.
+var defaultValidator = &CustomValidator{Validator: validator.New()}
+
+// Validate validates a struct against its "validate" tags, like echo's c.Validate did.
+func (h *Handler) Validate(i interface{}) error {
+	return defaultValidator.Validate(i)
+}
+
 type Error struct {
 	Message string `json:"message"`
 }
 
+// basicAuth replicates echo's middleware.BasicAuth: it parses the Authorization
+// header, calls authFunc and answers with a 401 challenge whenever it fails.
+func basicAuth(authFunc func(username, password string, c *gin.Context) (bool, error)) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		username, password, ok := parseBasicAuth(c.GetHeader("Authorization"))
+		if !ok {
+			basicAuthChallenge(c)
+			return
+		}
+
+		valid, err := authFunc(username, password, c)
+		if err != nil || !valid {
+			basicAuthChallenge(c)
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func parseBasicAuth(header string) (username, password string, ok bool) {
+	const prefix = "Basic "
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", "", false
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(header[len(prefix):])
+	if err != nil {
+		return "", "", false
+	}
+
+	credentials := strings.SplitN(string(raw), ":", 2)
+	if len(credentials) != 2 {
+		return "", "", false
+	}
+
+	return credentials[0], credentials[1], true
+}
+
+func basicAuthChallenge(c *gin.Context) {
+	c.Header("WWW-Authenticate", `Basic realm="Restricted"`)
+	c.AbortWithStatus(http.StatusUnauthorized)
+}
+
+// BasicAuthAdmin is the gin middleware guarding the admin routes.
+func (h *Handler) BasicAuthAdmin() gin.HandlerFunc {
+	return basicAuth(h.AuthenticateAdmin)
+}
+
+// BasicAuthUpdate is the gin middleware guarding the dyndns update routes.
+func (h *Handler) BasicAuthUpdate() gin.HandlerFunc {
+	return basicAuth(h.AuthenticateUpdate)
+}
+
 // Authenticate is the method the website admin user and the host update user have to authenticate against.
 // To gather admin rights the username password combination must match with the credentials given by the env var.
-func (h *Handler) AuthenticateUpdate(username, password string, c echo.Context) (bool, error) {
+func (h *Handler) AuthenticateUpdate(username, password string, c *gin.Context) (bool, error) {
 	h.CheckClearInterval()
-	reqParameter := c.QueryParam("hostname")
+	reqParameter := c.Query("hostname")
 	reqArr := strings.SplitN(reqParameter, ".", 2)
 	if len(reqArr) != 2 {
-		log.Error("Error: Something wrong with the hostname parameter")
+		log.Println("Error: Something wrong with the hostname parameter")
 		return false, nil
 	}
 
 	host := &model.Host{}
 	if err := h.DB.Where(&model.Host{UserName: username, Password: password, Hostname: reqArr[0], Domain: reqArr[1]}).First(host).Error; err != nil {
-		log.Error("Error: ", err)
+		log.Println("Error: ", err)
 		return false, nil
 	}
 	if host.ID == 0 {
-		log.Error("hostname or user user credentials unknown")
+		log.Println("hostname or user user credentials unknown")
 		return false, nil
 	}
 	c.Set("updateHost", host)
 
 	return true, nil
 }
-func (h *Handler) AuthenticateAdmin(username, password string, c echo.Context) (bool, error) {
+func (h *Handler) AuthenticateAdmin(username, password string, c *gin.Context) (bool, error) {
 	h.AuthAdmin = false
 	ok, err := h.authByEnv(username, password)
 	if err != nil {
-		log.Error("Error:", err)
+		log.Println("Error:", err)
 		return false, nil
 	}
 
@@ -106,12 +169,12 @@ func (h *Handler) authByEnv(username, password string) (bool, error) {
 // DDNS_ADMIN_LOGIN: The basic auth login string in htpasswd style.
 // DDNS_DOMAINS: All domains that will be handled by the dyndns server.
 func (h *Handler) ParseEnvs() (adminAuth bool, err error) {
-	log.Info("Read environment variables")
+	log.Println("Read environment variables")
 	h.Config = Envs{}
 	adminAuth = true
 	h.Config.AdminLogin = os.Getenv("DDNS_ADMIN_LOGIN")
 	if h.Config.AdminLogin == "" {
-		log.Info("No Auth! DDNS_ADMIN_LOGIN should be set")
+		log.Println("No Auth! DDNS_ADMIN_LOGIN should be set")
 		adminAuth = false
 		h.AuthAdmin = true
 		h.DisableAdminAuth = true
@@ -125,13 +188,13 @@ func (h *Handler) ParseEnvs() (adminAuth bool, err error) {
 	if ok {
 		h.AllowWildcard, err = strconv.ParseBool(allowWildcard)
 		if err == nil {
-			log.Info("Wildcard allowed")
+			log.Println("Wildcard allowed")
 		}
 	}
 	logoutUrl, ok := os.LookupEnv("DDNS_LOGOUT_URL")
 	if ok {
 		if len(logoutUrl) > 0 {
-			log.Info("Logout url set: ", logoutUrl)
+			log.Println("Logout url set: ", logoutUrl)
 			h.LogoutUrl = logoutUrl
 		}
 	}
@@ -139,9 +202,9 @@ func (h *Handler) ParseEnvs() (adminAuth bool, err error) {
 	clearEnv := os.Getenv("DDNS_CLEAR_LOG_INTERVAL")
 	clearInterval, err := strconv.ParseUint(clearEnv, 10, 32)
 	if err != nil {
-		log.Info("No log clear interval found")
+		log.Println("No log clear interval found")
 	} else {
-		log.Info("log clear interval found: ", clearInterval, "days")
+		log.Println("log clear interval found: ", clearInterval, "days")
 		h.ClearInterval = clearInterval
 		if clearInterval > 0 {
 			h.LastClearedLogs = time.Now()

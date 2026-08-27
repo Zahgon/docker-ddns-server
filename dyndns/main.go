@@ -2,28 +2,30 @@ package main
 
 import (
 	"html/template"
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/benjaminbear/docker-ddns-server/dyndns/handler"
 	"github.com/foolin/goview"
-	"github.com/foolin/goview/supports/echoview-v4"
-	"github.com/go-playground/validator/v10"
-	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
-	"github.com/labstack/gommon/log"
+	"github.com/foolin/goview/supports/ginview"
+	"github.com/gin-gonic/gin"
 )
 
-func main() {
-	// Set new instance
-	e := echo.New()
+// redirect sends the Location header verbatim like echo's c.Redirect did.
+// gin's c.Redirect delegates to http.Redirect, which rewrites a relative
+// Location into an absolute one and appends an HTML body.
+func redirect(c *gin.Context, code int, url string) {
+	c.Header("Location", url)
+	c.AbortWithStatus(code)
+}
 
-	e.Logger.SetLevel(log.ERROR)
-
-	e.Use(middleware.Logger())
+func setupRouter(h *handler.Handler, authAdmin bool) *gin.Engine {
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery())
 
 	// Set Renderer
-	e.Renderer = echoview.New(goview.Config{
+	router.HTMLRender = ginview.New(goview.Config{
 		Root:      "views",
 		Master:    "layouts/master",
 		Extension: ".html",
@@ -35,34 +37,20 @@ func main() {
 		DisableCache: true,
 	})
 
-	// Set Validator
-	e.Validator = &handler.CustomValidator{Validator: validator.New()}
-
 	// Set Statics
-	e.Static("/static", "static")
-
-	// Initialize handler
-	h := &handler.Handler{}
-
-	// Database connection
-	if err := h.InitDB(); err != nil {
-		e.Logger.Fatal(err)
-	}
-
-	authAdmin, err := h.ParseEnvs()
-	if err != nil {
-		e.Logger.Fatal(err)
-	}
+	router.Static("/static", "static")
 
 	// UI Routes
-	groupPublic := e.Group("/")
-	groupPublic.GET("*", func(c echo.Context) error {
+	redirectToAdmin := func(c *gin.Context) {
 		//redirect to admin
-		return c.Redirect(301, "./admin/")
-	})
-	groupAdmin := e.Group("/admin")
+		redirect(c, 301, "./admin/")
+	}
+	router.GET("/", redirectToAdmin)
+	router.NoRoute(redirectToAdmin)
+
+	groupAdmin := router.Group("/admin")
 	if authAdmin {
-		groupAdmin.Use(middleware.BasicAuth(h.AuthenticateAdmin))
+		groupAdmin.Use(h.BasicAuthAdmin())
 	}
 
 	groupAdmin.GET("/", h.ListHosts)
@@ -79,40 +67,60 @@ func main() {
 	groupAdmin.POST("/hosts/edit/:id", h.UpdateHost)
 	groupAdmin.GET("/hosts/delete/:id", h.DeleteHost)
 	//redirect to logout
-	groupAdmin.GET("/logout", func(c echo.Context) error {
+	groupAdmin.GET("/logout", func(c *gin.Context) {
 		// either custom url
 		if len(h.LogoutUrl) > 0 {
-			return c.Redirect(302, h.LogoutUrl)
+			redirect(c, 302, h.LogoutUrl)
+			return
 		}
 		// or standard url
-		return c.Redirect(302, "../")
+		redirect(c, 302, "../")
 	})
 	groupAdmin.POST("/cnames/add", h.CreateCName)
 	groupAdmin.GET("/cnames/delete/:id", h.DeleteCName)
 
 	// dyndns compatible api
 	// (avoid breaking changes and create groups for each update endpoint)
-	updateRoute := e.Group("/update")
-	updateRoute.Use(middleware.BasicAuth(h.AuthenticateUpdate))
+	updateRoute := router.Group("/update")
+	updateRoute.Use(h.BasicAuthUpdate())
 	updateRoute.GET("", h.UpdateIP)
-	nicRoute := e.Group("/nic")
-	nicRoute.Use(middleware.BasicAuth(h.AuthenticateUpdate))
+	nicRoute := router.Group("/nic")
+	nicRoute.Use(h.BasicAuthUpdate())
 	nicRoute.GET("/update", h.UpdateIP)
-	v2Route := e.Group("/v2")
-	v2Route.Use(middleware.BasicAuth(h.AuthenticateUpdate))
+	v2Route := router.Group("/v2")
+	v2Route.Use(h.BasicAuthUpdate())
 	v2Route.GET("/update", h.UpdateIP)
-	v3Route := e.Group("/v3")
-	v3Route.Use(middleware.BasicAuth(h.AuthenticateUpdate))
+	v3Route := router.Group("/v3")
+	v3Route.Use(h.BasicAuthUpdate())
 	v3Route.GET("/update", h.UpdateIP)
 
 	// health-check
-	e.GET("/ping", func(c echo.Context) error {
+	router.GET("/ping", func(c *gin.Context) {
 		u := &handler.Error{
 			Message: "OK",
 		}
-		return c.JSON(http.StatusOK, u)
+		c.JSON(http.StatusOK, u)
 	})
 
+	return router
+}
+
+func main() {
+	// Initialize handler
+	h := &handler.Handler{}
+
+	// Database connection
+	if err := h.InitDB(); err != nil {
+		log.Fatal(err)
+	}
+
+	authAdmin, err := h.ParseEnvs()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	router := setupRouter(h, authAdmin)
+
 	// Start server
-	e.Logger.Fatal(e.Start(":8080"))
+	log.Fatal(router.Run(":8080"))
 }

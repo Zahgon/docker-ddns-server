@@ -3,7 +3,7 @@ package nswrapper
 import (
 	"bytes"
 	"errors"
-	"github.com/labstack/gommon/log"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -25,7 +25,7 @@ func GetIPType(ipAddr string) string {
 // GetCallerIP searches for the "real" IP senders has actually.
 // If its a private address we won't use it.
 func GetCallerIP(r *http.Request) (string, error) {
-	log.Info("request", r.Header)
+	log.Println("request", r.Header)
 	for _, h := range []string{"X-Real-Ip", "X-Forwarded-For"} {
 		addresses := strings.Split(r.Header.Get(h), ",")
 		// march from right to left until we get a public address
